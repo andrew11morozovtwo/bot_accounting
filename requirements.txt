@@ -1,0 +1,19 @@
+# Telegram bot framework
+aiogram>=3.0.0
+
+# Database
+aiosqlite>=0.19.0
+
+# Google Sheets integration
+gspread>=5.0.0
+google-auth>=2.0.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Image processing and QR codes
+Pillow>=10.0.0
+pyzbar>=0.1.9
+
+# Logging (built-in, but may need additional config)
+# No external dependency needed
