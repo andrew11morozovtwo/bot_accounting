@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher
 from src.config import Config
 from src.utils.logging_config import setup_logging
 from src.middlewares.auth import AuthMiddleware
+from src.services.db import init_db
 from src.handlers import (
     start_router,
     admin_router,
@@ -24,6 +25,14 @@ async def main():
     """Main function to start the bot."""
     # Ensure directories exist
     Config.create_dirs()
+    
+    # Initialize database (create tables if not exist)
+    try:
+        init_db()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}", exc_info=True)
+        raise
     
     # Check if BOT_TOKEN is set
     if not Config.BOT_TOKEN:
