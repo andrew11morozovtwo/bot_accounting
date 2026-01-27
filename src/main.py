@@ -2,6 +2,7 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from src.config import Config
 from src.utils.logging_config import setup_logging
@@ -39,9 +40,10 @@ async def main():
         logger.error("BOT_TOKEN is not set in .env file!")
         raise ValueError("BOT_TOKEN is required. Please set it in .env file.")
     
-    # Initialize bot and dispatcher
+    # Initialize bot and dispatcher with FSM storage
     bot = Bot(token=Config.BOT_TOKEN)
-    dp = Dispatcher()
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
     
     # Register middleware
     dp.message.middleware(AuthMiddleware())

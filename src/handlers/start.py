@@ -11,6 +11,7 @@ from src.services.db import (
     UserRole,
     UserStatus
 )
+from src.keyboards.main_menu import main_menu
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -41,11 +42,23 @@ async def cmd_start(message: Message):
             UserRole.UNKNOWN.value: "Не зарегистрирован"
         }.get(existing_user.role, existing_user.role)
         
-        await message.answer(
-            f"Добро пожаловать, {fullname}!\n"
-            f"Ваша роль: {role_text}\n"
-            f"Статус: {existing_user.status}"
-        )
+        # Check if user is registered (not UNKNOWN)
+        if existing_user.role == UserRole.UNKNOWN.value:
+            await message.answer(
+                f"Добро пожаловать, {fullname}!\n"
+                f"Ваша роль: {role_text}\n"
+                f"Статус: {existing_user.status}\n\n"
+                f"⏳ Ваш аккаунт ожидает одобрения администратором.\n"
+                f"После одобрения вам будет предоставлен доступ к операциям."
+            )
+        else:
+            await message.answer(
+                f"Добро пожаловать, {fullname}!\n"
+                f"Ваша роль: {role_text}\n"
+                f"Статус: {existing_user.status}\n\n"
+                f"Выберите операцию из меню:",
+                reply_markup=main_menu
+            )
         logger.info(f"User {telegram_id} ({fullname}) already exists with role {existing_user.role}")
         return
     
@@ -73,12 +86,25 @@ async def cmd_start(message: Message):
         role_text = "Не зарегистрирован (ожидает одобрения)"
         logger.info(f"New user {telegram_id} ({fullname}) created with role UNKNOWN")
     
-    await message.answer(
-        f"Добро пожаловать, {fullname}!\n"
-        f"Вы успешно зарегистрированы.\n"
-        f"Ваша роль: {role_text}\n"
-        f"Статус: {new_user.status}"
-    )
+    # Check if user is registered (not UNKNOWN)
+    if new_user.role == UserRole.UNKNOWN.value:
+        await message.answer(
+            f"Добро пожаловать, {fullname}!\n"
+            f"Вы успешно зарегистрированы.\n"
+            f"Ваша роль: {role_text}\n"
+            f"Статус: {new_user.status}\n\n"
+            f"⏳ Ваш аккаунт ожидает одобрения администратором.\n"
+            f"После одобрения вам будет предоставлен доступ к операциям."
+        )
+    else:
+        await message.answer(
+            f"Добро пожаловать, {fullname}!\n"
+            f"Вы успешно зарегистрированы.\n"
+            f"Ваша роль: {role_text}\n"
+            f"Статус: {new_user.status}\n\n"
+            f"Выберите операцию из меню:",
+            reply_markup=main_menu
+        )
 
 
 @router.message(Command("help"))
