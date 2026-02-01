@@ -100,7 +100,11 @@ def print_warehouse_table():
             # Get instances directly from session
             from src.services.db import AssetInstance
             instances = session.query(AssetInstance).filter(AssetInstance.asset_id == asset.id).all()
-            in_stock = sum(1 for inst in instances if inst.state == AssetState.IN_STOCK.value)
+            # "На складе" = экземпляры со статусом IN_STOCK и не назначенные пользователю
+            in_stock = sum(1 for inst in instances 
+                          if inst.state == AssetState.IN_STOCK.value 
+                          and inst.assigned_to_user_id is None)
+            # "Назначено" = экземпляры, назначенные пользователю (независимо от статуса)
             assigned = sum(1 for inst in instances if inst.assigned_to_user_id is not None)
             
             # Get last incoming operation price
@@ -113,13 +117,15 @@ def print_warehouse_table():
             if last_incoming and last_incoming.price is not None:
                 last_price = f"{last_incoming.price:.2f} руб."
             
-            total_qty += len(instances) if instances else int(asset.qty)
+            # Use instances count if available, otherwise use asset.qty (for legacy data)
+            total_instances = len(instances) if len(instances) > 0 else int(asset.qty)
+            total_qty += total_instances
             total_in_stock += in_stock
             total_assigned += assigned
             
             # Print row
             print(f"{idx:<4} │ {asset.name:<{max_name_len}} │ {category_name:<15} │ {code:<15} │ "
-                  f"{len(instances) if instances else int(asset.qty):<8} │ {in_stock:<12} │ {assigned:<12} │ {last_price:<15}")
+                  f"{total_instances:<8} │ {in_stock:<12} │ {assigned:<12} │ {last_price:<15}")
         
         # Print totals
         print("─" * 120)

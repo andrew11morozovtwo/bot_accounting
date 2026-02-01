@@ -15,6 +15,7 @@ from src.handlers import (
     inventory_router,
     user_reg_router,
 )
+from src.tasks.auto_signature import run_auto_signature_task
 
 
 # Setup logging
@@ -65,12 +66,21 @@ async def main():
     except Exception as e:
         logger.warning(f"Failed to delete webhook: {e}")
     
+    # Start background task for auto-signature
+    auto_signature_task = asyncio.create_task(run_auto_signature_task(bot))
+    logger.info("Auto-signature background task started")
+    
     try:
         # Start polling
         await dp.start_polling(bot)
     except Exception as e:
         logger.error(f"Error occurred: {e}", exc_info=True)
     finally:
+        auto_signature_task.cancel()
+        try:
+            await auto_signature_task
+        except asyncio.CancelledError:
+            pass
         await bot.session.close()
         logger.info("Bot stopped")
 

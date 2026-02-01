@@ -1,16 +1,21 @@
 """Operations handlers."""
 import logging
-from aiogram import Router, F
+from datetime import datetime
+from aiogram import Router, F, Bot
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.services.db import (
     get_user_by_telegram_id,
+    get_user_by_id,
+    get_all_users,
     UserRole,
     create_asset,
     get_asset_by_code,
+    get_asset_by_id,
+    get_available_assets,
     update_asset,
     create_operation,
     OperationType,
@@ -20,9 +25,16 @@ from src.services.db import (
     get_category_by_name,
     create_category,
     create_asset_instance,
-    get_next_instance_number
+    get_next_instance_number,
+    get_available_asset_instances,
+    update_asset_instance,
+    update_operation_signature,
+    get_unsigned_outgoing_operations,
+    get_asset_instances_by_asset_id,
+    get_operation_by_id
 )
 from src.states.income import IncomeStates
+from src.states.outgoing import OutgoingStates
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -889,8 +901,8 @@ async def cancel_command(message: Message, state: FSMContext):
 
 
 @router.message(F.text == "Расход имущества")
-async def expense_handler(message: Message):
-    """Handle expense operation."""
+async def expense_handler(message: Message, state: FSMContext):
+    """Start outgoing operation flow."""
     user = message.from_user
     if not user:
         await message.answer("Ошибка: не удалось получить информацию о пользователе")
@@ -905,13 +917,580 @@ async def expense_handler(message: Message):
         )
         return
     
+    # Check if there are any available assets
+    available_assets = get_available_assets()
+    if not available_assets:
+        await message.answer(
+            "❌ <b>Нет доступного имущества на складе</b>\n\n"
+            "На складе нет активов с количеством больше нуля.\n"
+            "Сначала выполните операцию прихода имущества.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Start FSM flow
+    await state.set_state(OutgoingStates.waiting_for_asset_selection)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔍 Ввести код", callback_data="outgoing_enter_code")
+    builder.button(text="📋 Выбрать из списка", callback_data="outgoing_select_list")
+    builder.adjust(1)
+    
     await message.answer(
         "📤 <b>Расход имущества</b>\n\n"
-        "Эта операция позволяет зарегистрировать выдачу имущества со склада.\n\n"
-        "Функционал в разработке...",
+        "Выберите способ выбора актива:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    logger.info(f"User {message.from_user.id} started outgoing operation")
+
+
+@router.callback_query(F.data == "outgoing_enter_code", OutgoingStates.waiting_for_asset_selection)
+async def outgoing_enter_code(callback: CallbackQuery, state: FSMContext):
+    """Start entering asset code."""
+    await state.set_state(OutgoingStates.waiting_for_asset_code)
+    await callback.message.edit_text(
+        "🔍 <b>Ввод кода актива</b>\n\n"
+        "Введите код (QR-код, штрихкод) актива:",
         parse_mode="HTML"
     )
-    logger.info(f"User {message.from_user.id} started expense operation")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "outgoing_select_list", OutgoingStates.waiting_for_asset_selection)
+async def outgoing_select_list(callback: CallbackQuery, state: FSMContext):
+    """Show list of available assets."""
+    available_assets = get_available_assets()
+    
+    if not available_assets:
+        await callback.answer("❌ Нет доступных активов", show_alert=True)
+        await state.clear()
+        return
+    
+    builder = InlineKeyboardBuilder()
+    
+    for asset in available_assets:
+        category_name = asset.category_obj.name if asset.category_obj else "Без категории"
+        code_display = f" [{asset.code}]" if asset.code else ""
+        button_text = f"{asset.name}{code_display} (остаток: {int(asset.qty)})"
+        # Truncate if too long
+        if len(button_text) > 50:
+            button_text = button_text[:47] + "..."
+        builder.button(text=button_text, callback_data=f"outgoing_asset_{asset.id}")
+    
+    builder.adjust(1)
+    
+    await callback.message.edit_text(
+        "📋 <b>Выбор актива</b>\n\n"
+        "Выберите актив из списка:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@router.message(OutgoingStates.waiting_for_asset_code)
+async def process_asset_code(message: Message, state: FSMContext):
+    """Process asset code input."""
+    code = message.text.strip()
+    
+    if not code:
+        await message.answer("❌ Код не может быть пустым. Введите код актива:")
+        return
+    
+    asset = get_asset_by_code(code)
+    
+    if not asset:
+        await message.answer(
+            f"❌ Актив с кодом <b>{code}</b> не найден.\n\n"
+            "Проверьте правильность кода или выберите актив из списка.",
+            parse_mode="HTML"
+        )
+        return
+    
+    if asset.qty <= 0:
+        await message.answer(
+            f"❌ Актив <b>{asset.name}</b> недоступен для расхода.\n"
+            f"Текущее количество на складе: {int(asset.qty)}\n\n"
+            "Выберите другой актив.",
+            parse_mode="HTML"
+        )
+        return
+    
+    await state.update_data(asset_id=asset.id, asset_name=asset.name, asset_qty=asset.qty)
+    await state.set_state(OutgoingStates.waiting_for_recipient)
+    
+    # Get all users for recipient selection
+    users = get_all_users()
+    registered_users = [u for u in users if u.role != UserRole.UNKNOWN.value]
+    
+    if not registered_users:
+        await message.answer(
+            "❌ Нет зарегистрированных пользователей для выбора получателя.\n"
+            "Операция отменена."
+        )
+        await state.clear()
+        return
+    
+    builder = InlineKeyboardBuilder()
+    
+    for user in registered_users:
+        role_text = {
+            UserRole.SYSTEM_ADMIN.value: "Админ",
+            UserRole.MANAGER.value: "Менеджер",
+            UserRole.STOREKEEPER.value: "Кладовщик",
+            UserRole.FOREMAN.value: "Прораб",
+            UserRole.WORKER.value: "Рабочий"
+        }.get(user.role, user.role)
+        
+        button_text = f"{user.fullname} ({role_text})"
+        if len(button_text) > 50:
+            button_text = button_text[:47] + "..."
+        builder.button(text=button_text, callback_data=f"outgoing_recipient_{user.id}")
+    
+    builder.adjust(1)
+    
+    await message.answer(
+        f"✅ Актив: <b>{asset.name}</b>\n"
+        f"Код: <b>{asset.code or 'не указан'}</b>\n"
+        f"Доступно на складе: <b>{int(asset.qty)}</b>\n\n"
+        "Выберите получателя:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+
+
+@router.callback_query(F.data.startswith("outgoing_asset_"))
+async def select_outgoing_asset(callback: CallbackQuery, state: FSMContext):
+    """Select asset from list."""
+    asset_id = int(callback.data.split("_")[2])
+    asset = get_asset_by_id(asset_id)
+    
+    if not asset:
+        await callback.answer("❌ Актив не найден", show_alert=True)
+        return
+    
+    if asset.qty <= 0:
+        await callback.answer("❌ Актив недоступен для расхода", show_alert=True)
+        return
+    
+    await state.update_data(asset_id=asset.id, asset_name=asset.name, asset_qty=asset.qty)
+    await state.set_state(OutgoingStates.waiting_for_recipient)
+    
+    # Get all users for recipient selection
+    users = get_all_users()
+    registered_users = [u for u in users if u.role != UserRole.UNKNOWN.value]
+    
+    if not registered_users:
+        await callback.answer("❌ Нет зарегистрированных пользователей", show_alert=True)
+        await state.clear()
+        return
+    
+    builder = InlineKeyboardBuilder()
+    
+    for user in registered_users:
+        role_text = {
+            UserRole.SYSTEM_ADMIN.value: "Админ",
+            UserRole.MANAGER.value: "Менеджер",
+            UserRole.STOREKEEPER.value: "Кладовщик",
+            UserRole.FOREMAN.value: "Прораб",
+            UserRole.WORKER.value: "Рабочий"
+        }.get(user.role, user.role)
+        
+        button_text = f"{user.fullname} ({role_text})"
+        if len(button_text) > 50:
+            button_text = button_text[:47] + "..."
+        builder.button(text=button_text, callback_data=f"outgoing_recipient_{user.id}")
+    
+    builder.adjust(1)
+    
+    await callback.message.edit_text(
+        f"✅ Актив: <b>{asset.name}</b>\n"
+        f"Код: <b>{asset.code or 'не указан'}</b>\n"
+        f"Доступно на складе: <b>{int(asset.qty)}</b>\n\n"
+        "Выберите получателя:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("outgoing_recipient_"), OutgoingStates.waiting_for_recipient)
+async def select_outgoing_recipient(callback: CallbackQuery, state: FSMContext):
+    """Select recipient for outgoing operation."""
+    recipient_id = int(callback.data.split("_")[2])
+    recipient = get_user_by_id(recipient_id)
+    
+    if not recipient:
+        await callback.answer("❌ Пользователь не найден", show_alert=True)
+        return
+    
+    await state.update_data(recipient_id=recipient.id, recipient_name=recipient.fullname)
+    await state.set_state(OutgoingStates.waiting_for_qty)
+    
+    data = await state.get_data()
+    asset_qty = data['asset_qty']
+    
+    await callback.message.edit_text(
+        f"✅ Получатель: <b>{recipient.fullname}</b>\n\n"
+        f"Введите количество для расхода (доступно: <b>{int(asset_qty)}</b>):",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.message(OutgoingStates.waiting_for_qty)
+async def process_outgoing_qty(message: Message, state: FSMContext):
+    """Process quantity for outgoing operation."""
+    try:
+        qty = float(message.text.strip().replace(",", "."))
+        if qty <= 0:
+            raise ValueError("Quantity must be positive")
+        if qty != int(qty):
+            raise ValueError("Quantity must be integer")
+        qty = int(qty)
+    except ValueError:
+        await message.answer("❌ Неверный формат количества. Введите целое число (например: 1, 5, 10):")
+        return
+    
+    data = await state.get_data()
+    asset_qty = data['asset_qty']
+    
+    if qty > asset_qty:
+        await message.answer(
+            f"❌ Недостаточно товара на складе.\n\n"
+            f"Запрошено: <b>{qty}</b>\n"
+            f"Доступно: <b>{int(asset_qty)}</b>\n\n"
+            f"Введите количество не больше {int(asset_qty)}:",
+            parse_mode="HTML"
+        )
+        return
+    
+    await state.update_data(qty=qty)
+    await state.set_state(OutgoingStates.waiting_for_confirm)
+    
+    asset_name = data['asset_name']
+    recipient_name = data['recipient_name']
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data="outgoing_confirm")
+    builder.button(text="❌ Отменить", callback_data="outgoing_cancel")
+    builder.adjust(1)
+    
+    await message.answer(
+        "📋 <b>Подтверждение операции расхода</b>\n\n"
+        f"Актив: <b>{asset_name}</b>\n"
+        f"Получатель: <b>{recipient_name}</b>\n"
+        f"Количество: <b>{qty}</b>\n\n"
+        "Подтвердите операцию:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+
+
+@router.callback_query(F.data == "outgoing_confirm", OutgoingStates.waiting_for_confirm)
+async def confirm_outgoing(callback: CallbackQuery, state: FSMContext):
+    """Confirm and save outgoing operation."""
+    data = await state.get_data()
+    asset_id = data['asset_id']
+    asset_name = data['asset_name']
+    recipient_id = data['recipient_id']
+    recipient_name = data['recipient_name']
+    qty = data['qty']
+    
+    # Get current user (who performs the operation)
+    user = callback.from_user
+    if not user:
+        await callback.answer("❌ Ошибка: не удалось получить информацию о пользователе", show_alert=True)
+        await state.clear()
+        return
+    
+    db_user = get_user_by_telegram_id(user.id)
+    if not db_user:
+        await callback.answer("❌ Ошибка: пользователь не найден в БД", show_alert=True)
+        await state.clear()
+        return
+    
+    try:
+        # Get current asset to check quantity
+        asset = get_asset_by_id(asset_id)
+        if not asset:
+            raise ValueError("Актив не найден")
+        
+        if asset.qty < qty:
+            raise ValueError(f"Недостаточно товара на складе. Доступно: {int(asset.qty)}")
+        
+        # Get available instances (not assigned yet)
+        available_instances = get_available_asset_instances(asset_id, limit=int(qty))
+        
+        if len(available_instances) < int(qty):
+            raise ValueError(
+                f"Недостаточно доступных экземпляров на складе. "
+                f"Запрошено: {int(qty)}, доступно: {len(available_instances)}"
+            )
+        
+        # Create operation
+        operation = create_operation(
+            type=OperationType.OUTGOING.value,
+            asset_id=asset_id,
+            qty=qty,
+            from_user_id=db_user.id,  # User who performs the operation
+            to_user_id=recipient_id,   # Recipient
+            comment=f"Расход имущества: {asset_name}"
+        )
+        
+        # Assign instances to recipient first
+        instances_assigned = 0
+        for instance in available_instances[:int(qty)]:
+            update_asset_instance(
+                instance_id=instance.id,
+                assigned_to_user_id=recipient_id,
+                state=AssetState.IN_USE.value
+            )
+            instances_assigned += 1
+        
+        logger.info(
+            f"Assigned {instances_assigned} instances of asset {asset_id} to user {recipient_id}"
+        )
+        
+        # Update asset quantity after assigning instances
+        new_qty = asset.qty - qty
+        updated_asset = update_asset(asset_id=asset_id, qty=new_qty)
+        
+        if updated_asset:
+            logger.info(
+                f"Updated asset {asset_id} quantity: {asset.qty} -> {new_qty}"
+            )
+        else:
+            logger.error(f"Failed to update asset {asset_id} quantity")
+        
+        # Note: We don't change asset state when quantity becomes zero
+        # The state remains as is (typically IN_STOCK)
+        # Quantity being zero just means no items are available, not that the asset is written off
+        
+        success_text = (
+            "✅ <b>Операция расхода успешно выполнена!</b>\n\n"
+            f"Актив: <b>{asset_name}</b>\n"
+            f"Получатель: <b>{recipient_name}</b>\n"
+            f"Количество: <b>{qty}</b>\n"
+            f"Остаток на складе: <b>{int(new_qty)}</b>"
+        )
+        
+        # Check if message has photo
+        if callback.message.photo:
+            await callback.message.edit_caption(
+                caption=success_text,
+                parse_mode="HTML"
+            )
+        else:
+            await callback.message.edit_text(
+                success_text,
+                parse_mode="HTML"
+            )
+        
+        await callback.answer("✅ Операция сохранена")
+        logger.info(
+            f"Outgoing operation created: asset_id={asset_id}, qty={qty}, "
+            f"from_user_id={db_user.id}, to_user_id={recipient_id}"
+        )
+        
+        # Send notification to recipient with confirmation button
+        await send_recipient_notification(
+            bot=callback.bot,
+            operation_id=operation.id,
+            recipient_id=recipient_id,
+            asset_name=asset_name,
+            qty=qty,
+            instances=available_instances[:int(qty)]
+        )
+        
+    except Exception as e:
+        logger.error(f"Error saving outgoing operation: {e}", exc_info=True)
+        await callback.answer("❌ Ошибка при сохранении операции", show_alert=True)
+        
+        error_text = (
+            "❌ Произошла ошибка при сохранении операции.\n\n"
+            "Возможные причины:\n"
+            "- Проблема с базой данных\n"
+            "- Недостаточно товара на складе\n"
+            "- Несоответствие схемы БД\n\n"
+            "Попробуйте начать операцию заново или обратитесь к администратору."
+        )
+        
+        # Check if message has photo
+        if callback.message.photo:
+            await callback.message.edit_caption(
+                caption=error_text,
+                parse_mode="HTML"
+            )
+        else:
+            await callback.message.edit_text(
+                error_text,
+                parse_mode="HTML"
+            )
+    
+    await state.clear()
+
+
+async def send_recipient_notification(
+    bot: Bot,
+    operation_id: int,
+    recipient_id: int,
+    asset_name: str,
+    qty: int,
+    instances: list
+):
+    """Send notification to recipient about received assets."""
+    recipient_user = get_user_by_id(recipient_id)
+    if not recipient_user:
+        logger.error(f"Recipient user {recipient_id} not found")
+        return
+    
+    # Get operation to get price and from_user (manager)
+    operation = get_operation_by_id(operation_id)
+    if not operation:
+        logger.error(f"Operation {operation_id} not found")
+        return
+    
+    # Get manager (from_user) information
+    manager_user = None
+    manager_link = ""
+    if operation.from_user_id:
+        manager_user = get_user_by_id(operation.from_user_id)
+        if manager_user:
+            # Create Telegram deep link for private message
+            manager_link = f'<a href="tg://user?id={manager_user.telegram_id}">начальнику лично</a>'
+        else:
+            manager_link = "начальнику лично"
+    else:
+        manager_link = "начальнику лично"
+    
+    # Get price per unit (from operation or from instances)
+    price_per_unit = None
+    if operation.price is not None:
+        price_per_unit = operation.price
+    elif instances and instances[0].price is not None:
+        price_per_unit = instances[0].price
+    
+    # Build message text
+    instances_text = "\n".join([
+        f"  • {inst.distinctive_features}" for inst in instances
+    ])
+    
+    price_text = ""
+    if price_per_unit is not None:
+        price_text = f"\n<b>Цена за единицу:</b> {price_per_unit:.2f} руб."
+    
+    message_text = (
+        "📦 <b>Вам передано имущество</b>\n\n"
+        f"<b>Наименование:</b> {asset_name}\n"
+        f"<b>Количество:</b> {qty}{price_text}\n\n"
+        f"<b>Экземпляры:</b>\n{instances_text}\n\n"
+        "Вы несете ответственность за сохранность переданного имущества.\n\n"
+        f"Если вы не согласны с передачей, обратитесь к {manager_link}.\n\n"
+        "Подтвердите получение имущества:"
+    )
+    
+    # Build keyboard with confirmation button
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Имущество получил", callback_data=f"confirm_receipt_{operation_id}")
+    builder.adjust(1)
+    
+    # Get first instance photo if available
+    photo_file_id = None
+    for instance in instances:
+        if instance.photo_file_id:
+            photo_file_id = instance.photo_file_id
+            break
+    
+    try:
+        if photo_file_id:
+            await bot.send_photo(
+                chat_id=recipient_user.telegram_id,
+                photo=photo_file_id,
+                caption=message_text,
+                parse_mode="HTML",
+                reply_markup=builder.as_markup()
+            )
+        else:
+            await bot.send_message(
+                chat_id=recipient_user.telegram_id,
+                text=message_text,
+                parse_mode="HTML",
+                reply_markup=builder.as_markup()
+            )
+        logger.info(f"Sent receipt notification to recipient {recipient_id} for operation {operation_id}")
+    except Exception as e:
+        logger.error(f"Failed to send notification to recipient {recipient_id}: {e}", exc_info=True)
+
+
+@router.callback_query(F.data.startswith("confirm_receipt_"))
+async def confirm_receipt(callback: CallbackQuery):
+    """Handle recipient confirmation of asset receipt."""
+    operation_id = int(callback.data.split("_")[2])
+    
+    user = callback.from_user
+    if not user:
+        await callback.answer("❌ Ошибка: не удалось получить информацию о пользователе", show_alert=True)
+        return
+    
+    db_user = get_user_by_telegram_id(user.id)
+    if not db_user:
+        await callback.answer("❌ Пользователь не найден в базе данных", show_alert=True)
+        return
+    
+    # Get operation
+    operation = get_operation_by_id(operation_id)
+    
+    if not operation:
+        await callback.answer("❌ Операция не найдена", show_alert=True)
+        return
+    
+    # Check if user is the recipient
+    if operation.to_user_id != db_user.id:
+        await callback.answer("❌ Вы не являетесь получателем этого имущества", show_alert=True)
+        return
+    
+    # Check if already signed
+    if operation.signed_at:
+        await callback.answer("✅ Имущество уже подтверждено", show_alert=True)
+        return
+    
+    # Update operation with signature
+    update_operation_signature(
+        operation_id=operation_id,
+        signed_by_user_id=db_user.id,
+        auto_signed=False
+    )
+    
+    # Update message - check if message has photo
+    confirmation_text = (
+        "✅ <b>Имущество подтверждено</b>\n\n"
+        "Вы подтвердили получение имущества.\n"
+        "Вы несете ответственность за его сохранность."
+    )
+    
+    if callback.message.photo:
+        await callback.message.edit_caption(
+            caption=confirmation_text,
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.edit_text(
+            text=confirmation_text,
+            parse_mode="HTML"
+        )
+    
+    await callback.answer("✅ Получение имущества подтверждено")
+    logger.info(f"User {db_user.id} confirmed receipt of operation {operation_id}")
+
+
+@router.callback_query(F.data == "outgoing_cancel", OutgoingStates.waiting_for_confirm)
+async def cancel_outgoing(callback: CallbackQuery, state: FSMContext):
+    """Cancel outgoing operation."""
+    await callback.answer("Операция отменена")
+    await callback.message.edit_text("❌ Операция расхода отменена.")
+    await state.clear()
 
 
 @router.message(F.text == "Списание имущества")

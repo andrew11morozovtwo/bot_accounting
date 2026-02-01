@@ -213,6 +213,10 @@ class Operation(Base):
     timestamp = Column(DateTime, nullable=False, server_default=func.now())
     comment = Column(Text, nullable=True)
     photo_file_id = Column(String(255), nullable=True)  # Telegram file_id (optional)
+    # Fields for recipient signature confirmation
+    signed_at = Column(DateTime, nullable=True)  # When recipient confirmed receipt
+    signed_by_user = Column(Integer, ForeignKey("users.id"), nullable=True)  # Who signed (recipient)
+    auto_signed = Column(Boolean, nullable=False, default=False)  # True if auto-signed after 24h
     
     # Relationships
     asset = relationship("Asset", back_populates="operations")
@@ -442,7 +446,7 @@ def _migrate_asset_instances_table(engine):
 
 
 def _migrate_operations_table(engine):
-    """Migrate operations table to add price column if needed."""
+    """Migrate operations table to add new columns if needed."""
     import sqlite3
     from sqlalchemy import inspect
     
@@ -458,22 +462,25 @@ def _migrate_operations_table(engine):
     
     columns = [col['name'] for col in inspector.get_columns('operations')]
     
-    if 'price' in columns:
-        # Migration not needed or already done
-        return
-    
-    # Migration needed
-    logger.info("Migrating operations table: adding price column")
-    
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
     try:
-        # Add price column
-        cursor.execute("ALTER TABLE operations ADD COLUMN price FLOAT")
+        # Add price column if needed
+        if 'price' not in columns:
+            logger.info("Migrating operations table: adding price column")
+            cursor.execute("ALTER TABLE operations ADD COLUMN price FLOAT")
+            logger.info("Migration completed: added price column to operations")
+        
+        # Add signature-related columns if needed
+        if 'signed_at' not in columns:
+            logger.info("Migrating operations table: adding signature columns")
+            cursor.execute("ALTER TABLE operations ADD COLUMN signed_at DATETIME")
+            cursor.execute("ALTER TABLE operations ADD COLUMN signed_by_user INTEGER")
+            cursor.execute("ALTER TABLE operations ADD COLUMN auto_signed BOOLEAN DEFAULT 0")
+            logger.info("Migration completed: added signature columns to operations")
         
         conn.commit()
-        logger.info("Migration completed: added price column to operations")
         
     except Exception as e:
         conn.rollback()
@@ -659,6 +666,33 @@ def get_all_assets() -> list[Asset]:
         session.close()
 
 
+def get_available_assets() -> list[Asset]:
+    """Get all assets with quantity greater than zero (available for outgoing)."""
+    from sqlalchemy.orm import joinedload
+    
+    session = get_session()
+    try:
+        # Use joinedload to eagerly load category_obj to avoid DetachedInstanceError
+        assets = session.query(Asset).options(
+            joinedload(Asset.category_obj)
+        ).filter(Asset.qty > 0).order_by(Asset.name).all()
+        
+        # Access category_obj for each asset while session is still open
+        # This ensures the relationship is loaded before session closes
+        for asset in assets:
+            if asset.category_obj:
+                # Access the category to ensure it's loaded
+                _ = asset.category_obj.name
+        
+        # Expunge all objects from session so they can be used after session closes
+        # The relationships are already loaded, so they'll remain accessible
+        session.expunge_all()
+        
+        return assets
+    finally:
+        session.close()
+
+
 def update_asset(
     asset_id: int,
     name: Optional[str] = None,
@@ -837,6 +871,49 @@ def create_category(name: str) -> Category:
         session.close()
 
 
+def update_operation_signature(
+    operation_id: int,
+    signed_by_user_id: int,
+    auto_signed: bool = False
+) -> Optional[Operation]:
+    """Update operation with recipient signature."""
+    from datetime import datetime
+    session = get_session()
+    try:
+        operation = session.query(Operation).filter(Operation.id == operation_id).first()
+        if not operation:
+            return None
+        
+        operation.signed_at = datetime.now()
+        operation.signed_by_user = signed_by_user_id
+        operation.auto_signed = auto_signed
+        
+        session.commit()
+        session.refresh(operation)
+        return operation
+    except Exception as e:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_unsigned_outgoing_operations() -> list[Operation]:
+    """Get all outgoing operations that haven't been signed yet and are older than 24 hours."""
+    from datetime import datetime, timedelta
+    session = get_session()
+    try:
+        # Get operations that are unsigned and older than 24 hours
+        cutoff_time = datetime.now() - timedelta(hours=24)
+        return session.query(Operation).filter(
+            Operation.type == OperationType.OUTGOING.value,
+            Operation.signed_at.is_(None),
+            Operation.timestamp <= cutoff_time
+        ).all()
+    finally:
+        session.close()
+
+
 # ============================================================================
 # DAO/Repository Functions for AssetInstance
 # ============================================================================
@@ -876,6 +953,24 @@ def get_asset_instances_by_asset_id(asset_id: int) -> list[AssetInstance]:
     session = get_session()
     try:
         return session.query(AssetInstance).filter(AssetInstance.asset_id == asset_id).all()
+    finally:
+        session.close()
+
+
+def get_available_asset_instances(asset_id: int, limit: Optional[int] = None) -> list[AssetInstance]:
+    """Get available (not assigned) instances for a specific asset."""
+    session = get_session()
+    try:
+        query = session.query(AssetInstance).filter(
+            AssetInstance.asset_id == asset_id,
+            AssetInstance.assigned_to_user_id.is_(None),
+            AssetInstance.state == AssetState.IN_STOCK.value
+        ).order_by(AssetInstance.id)
+        
+        if limit:
+            query = query.limit(limit)
+        
+        return query.all()
     finally:
         session.close()
 
