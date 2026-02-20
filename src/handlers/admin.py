@@ -169,8 +169,11 @@ async def set_role_callback(callback: CallbackQuery):
         await callback.answer("❌ У вас нет прав доступа.", show_alert=True)
         return
     
-    # Extract user ID and role from callback data
-    parts = callback.data.split("_")
+    # Extract user ID and role from callback data (role may contain underscore, e.g. system_admin)
+    parts = callback.data.split("_", 3)  # max 3 splits: "set", "role", "2", "system_admin"
+    if len(parts) < 4:
+        await callback.answer("❌ Неверные данные.", show_alert=True)
+        return
     user_id = int(parts[2])
     new_role = parts[3]
     

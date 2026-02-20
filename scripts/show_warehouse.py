@@ -2,8 +2,17 @@
 """Script to display warehouse data from database in table format."""
 import sys
 import os
+import io
 import logging
 import warnings
+
+# Windows: UTF-8 для консоли, чтобы русский и символы таблицы отображались
+if sys.platform == "win32":
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # Suppress all warnings and logging
 warnings.filterwarnings('ignore')
@@ -79,121 +88,60 @@ def print_warehouse_table():
         max_name_len = max(len(asset.name) for asset, _ in assets_data)
         max_name_len = max(max_name_len, 20)
         
-        # Table header
-        print("\n" + "=" * 120)
-        print("СОСТОЯНИЕ СКЛАДА".center(120))
-        print("=" * 120)
+        # Table header: Код и Всего убраны; Цена уже; добавлены Фото (приход) и Фото возврат
+        col_price = 10   # узкий столбец "Цена"
+        col_photo = 6    # Фото приход (есть/—)
+        col_return_photo = 14  # Фото при возврате (количество)
+        total_width = 4 + 3 + max_name_len + 3 + 15 + 3 + 12 + 3 + 12 + 3 + col_price + 3 + col_photo + 3 + col_return_photo
+        print("\n" + "=" * total_width)
+        print("СОСТОЯНИЕ СКЛАДА".center(total_width))
+        print("=" * total_width)
         print()
-        print(f"{'№':<4} │ {'Название':<{max_name_len}} │ {'Категория':<15} │ {'Код':<15} │ {'Всего':<8} │ {'На складе':<12} │ {'Назначено':<12} │ {'Последняя цена':<15}")
-        print("─" * 120)
+        print(f"{'No':<4} | {'Название':<{max_name_len}} | {'Категория':<15} | {'На складе':<12} | {'Назначено':<12} | {'Цена':<{col_price}} | {'Фото':<{col_photo}} | {'Фото возврат':<{col_return_photo}}")
+        print("-" * total_width)
         
-        total_qty = 0
         total_in_stock = 0
         total_assigned = 0
         
-        # Get operations to find last incoming price
-        from src.services.db import Operation
+        from src.services.db import Operation, AssetInstance, AssetReturnPhoto
         for idx, (asset, category) in enumerate(assets_data, 1):
             category_name = category.name if category else "-"
-            code = asset.code or "-"
             
-            # Get instances directly from session
-            from src.services.db import AssetInstance
             instances = session.query(AssetInstance).filter(AssetInstance.asset_id == asset.id).all()
-            # "На складе" = экземпляры со статусом IN_STOCK и не назначенные пользователю
-            in_stock = sum(1 for inst in instances 
-                          if inst.state == AssetState.IN_STOCK.value 
+            in_stock = sum(1 for inst in instances
+                          if inst.state == AssetState.IN_STOCK.value
                           and inst.assigned_to_user_id is None)
-            # "Назначено" = экземпляры, назначенные пользователю (независимо от статуса)
             assigned = sum(1 for inst in instances if inst.assigned_to_user_id is not None)
             
-            # Get last incoming operation price
             last_incoming = session.query(Operation).filter(
                 Operation.asset_id == asset.id,
                 Operation.type == OperationType.INCOMING.value
             ).order_by(Operation.timestamp.desc()).first()
-            
             last_price = "-"
             if last_incoming and last_incoming.price is not None:
-                last_price = f"{last_incoming.price:.2f} руб."
+                last_price = f"{last_incoming.price:.2f}"
+            if len(last_price) > col_price:
+                last_price = last_price[: col_price - 1] + "…"
             
-            # Use instances count if available, otherwise use asset.qty (for legacy data)
-            total_instances = len(instances) if len(instances) > 0 else int(asset.qty)
-            total_qty += total_instances
+            # Фото при приходе: в БД хранится file_id, имени файла нет — показываем наличие
+            photo_income = "есть" if (getattr(asset, 'first_income_photo_file_id', None)) else "—"
+            return_photos_count = session.query(AssetReturnPhoto).filter(
+                AssetReturnPhoto.asset_id == asset.id
+            ).count()
+            photo_return_str = str(return_photos_count)
+            
             total_in_stock += in_stock
             total_assigned += assigned
             
-            # Print row
-            print(f"{idx:<4} │ {asset.name:<{max_name_len}} │ {category_name:<15} │ {code:<15} │ "
-                  f"{total_instances:<8} │ {in_stock:<12} │ {assigned:<12} │ {last_price:<15}")
+            print(f"{idx:<4} | {asset.name:<{max_name_len}} | {category_name:<15} | {in_stock:<12} | {assigned:<12} | {last_price:<{col_price}} | {photo_income:<{col_photo}} | {photo_return_str:<{col_return_photo}}")
         
-        # Print totals
-        print("─" * 120)
-        print(f"{'ИТОГО':<4} │ {'':<{max_name_len}} │ {'':<15} │ {'':<15} │ "
-              f"{total_qty:<8} │ {total_in_stock:<12} │ {total_assigned:<12} │ {'':<15}")
+        print("-" * total_width)
+        print(f"{'ИТОГО':<4} | {'':<{max_name_len}} | {'':<15} | {total_in_stock:<12} | {total_assigned:<12} | {'':<{col_price}} | {'':<{col_photo}} | {'':<{col_return_photo}}")
         print()
         
     finally:
         session.close()
         logging.getLogger('sqlalchemy.engine').disabled = False
-
-
-def print_incoming_operations():
-    """Print incoming operations with prices for control."""
-    from src.services.db import Operation, Asset
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-    from src.config import Config
-    
-    # Create a new engine without echo
-    db_url = f"sqlite:///{Config.DB_PATH}"
-    engine = create_engine(
-        db_url,
-        echo=False,
-        connect_args={"check_same_thread": False}
-    )
-    
-    SessionLocal = sessionmaker(bind=engine)
-    session = SessionLocal()
-    try:
-        # Get all incoming operations ordered by timestamp desc
-        operations = session.query(Operation, Asset).join(
-            Asset, Operation.asset_id == Asset.id
-        ).filter(
-            Operation.type == OperationType.INCOMING.value
-        ).order_by(Operation.timestamp.desc()).limit(20).all()
-        
-        if not operations:
-            return
-        
-        print("=" * 120)
-        print("ОПЕРАЦИИ ПРИХОДА (последние 20)".center(120))
-        print("=" * 120)
-        print()
-        print(f"{'№':<4} │ {'Дата':<19} │ {'Товар':<30} │ {'Код':<15} │ {'Кол-во':<8} │ {'Цена за ед.':<15} │ {'Сумма':<15}")
-        print("─" * 120)
-        
-        for idx, (op, asset) in enumerate(operations, 1):
-            date_str = op.timestamp.strftime('%Y-%m-%d %H:%M')
-            price_str = f"{op.price:.2f} руб." if op.price is not None else "-"
-            total_str = f"{op.price * op.qty:.2f} руб." if op.price is not None else "-"
-            
-            print(f"{idx:<4} │ {date_str:<19} │ {asset.name[:29]:<30} │ {asset.code or '-':<15} │ "
-                  f"{op.qty:<8} │ {price_str:<15} │ {total_str:<15}")
-        
-        print("─" * 120)
-        
-        # Calculate totals
-        total_qty = sum(op.qty for op, _ in operations)
-        operations_with_price = [(op, asset) for op, asset in operations if op.price is not None]
-        total_sum = sum(op.price * op.qty for op, _ in operations_with_price)
-        
-        print(f"{'ИТОГО':<4} │ {'':<19} │ {'':<30} │ {'':<15} │ "
-              f"{total_qty:<8} │ {'':<15} │ {f'{total_sum:.2f} руб.' if operations_with_price else '-':<15}")
-        print()
-        
-    finally:
-        session.close()
 
 
 def main():
@@ -218,10 +166,6 @@ def main():
         sys.stderr = old_stderr
         
         print_warehouse_table()
-        
-        # Print incoming operations with prices
-        print_incoming_operations()
-        
         print("=" * 120)
     except Exception as e:
         sys.stderr = old_stderr

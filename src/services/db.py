@@ -145,7 +145,10 @@ class Asset(Base):
     state = Column(String(50), nullable=False, default=AssetState.IN_STOCK.value)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
-    
+    # Первая фотография — с операции «Приход имущества»
+    first_income_photo_file_id = Column(String(255), nullable=True)
+    first_income_photo_at = Column(DateTime, nullable=True)
+
     # Relationships
     owner = relationship("User", back_populates="owned_assets", foreign_keys=[owner_user_id])
     category_obj = relationship("Category", back_populates="assets")
@@ -247,6 +250,35 @@ class LogEntry(Base):
     user = relationship("User", back_populates="log_entries")
 
 
+class PendingReturn(Base):
+    """
+    Запрос на возврат на склад (ожидает подтверждения кладовщика или админа).
+    """
+    __tablename__ = "pending_returns"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    from_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    asset_id = Column(Integer, ForeignKey("assets.id"), nullable=False)
+    asset_name = Column(String(255), nullable=False)
+    qty = Column(Float, nullable=False)
+    status = Column(String(20), nullable=False, default="pending")  # pending, approved, rejected
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    reviewed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+
+
+class AssetReturnPhoto(Base):
+    """
+    Фото товара при возврате на склад (кладовщик). Храним 5 последних по каждому активу.
+    """
+    __tablename__ = "asset_return_photos"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    asset_id = Column(Integer, ForeignKey("assets.id"), nullable=False, index=True)
+    photo_file_id = Column(String(255), nullable=False)
+    photo_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
 # ============================================================================
 # Database Initialization
 # ============================================================================
@@ -291,8 +323,34 @@ def init_db():
     
     # Migrate operations table if needed (add price)
     _migrate_operations_table(engine)
-    
+
+    # Добавить колонки первой фото с прихода в assets
+    _migrate_assets_first_income_photo(engine)
+
     return engine
+
+
+def _migrate_assets_first_income_photo(engine):
+    """Добавить first_income_photo_file_id и first_income_photo_at в assets при отсутствии."""
+    from sqlalchemy import inspect
+    import sqlite3
+    inspector = inspect(engine)
+    if "assets" not in inspector.get_table_names():
+        return
+    columns = [c["name"] for c in inspector.get_columns("assets")]
+    conn = sqlite3.connect(Config.DB_PATH)
+    cur = conn.cursor()
+    try:
+        if "first_income_photo_file_id" not in columns:
+            cur.execute("ALTER TABLE assets ADD COLUMN first_income_photo_file_id VARCHAR(255)")
+        if "first_income_photo_at" not in columns:
+            cur.execute("ALTER TABLE assets ADD COLUMN first_income_photo_at DATETIME")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.warning("Migration first_income_photo: %s", e)
+    finally:
+        conn.close()
 
 
 def _migrate_assets_table(engine):
@@ -603,6 +661,90 @@ def update_user(
         session.close()
 
 
+def get_return_approver() -> Optional[User]:
+    """Кто подтверждает возврат на склад: сначала кладовщик, если нет — системный администратор."""
+    session = get_session()
+    try:
+        storekeeper = session.query(User).filter(
+            User.role == UserRole.STOREKEEPER.value,
+            User.status == UserStatus.ACTIVE.value
+        ).first()
+        if storekeeper:
+            return storekeeper
+        admin = session.query(User).filter(
+            User.role == UserRole.SYSTEM_ADMIN.value,
+            User.status == UserStatus.ACTIVE.value
+        ).first()
+        return admin
+    finally:
+        session.close()
+
+
+# ============================================================================
+# DAO/Repository Functions for PendingReturn
+# ============================================================================
+
+def create_pending_return(
+    from_user_id: int,
+    asset_id: int,
+    asset_name: str,
+    qty: float
+) -> PendingReturn:
+    """Create a pending return request."""
+    session = get_session()
+    try:
+        pr = PendingReturn(
+            from_user_id=from_user_id,
+            asset_id=asset_id,
+            asset_name=asset_name,
+            qty=qty,
+            status="pending"
+        )
+        session.add(pr)
+        session.commit()
+        session.refresh(pr)
+        return pr
+    except Exception as e:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_pending_return_by_id(pending_id: int) -> Optional[PendingReturn]:
+    """Get pending return by id."""
+    session = get_session()
+    try:
+        return session.query(PendingReturn).filter(PendingReturn.id == pending_id).first()
+    finally:
+        session.close()
+
+
+def update_pending_return_status(
+    pending_id: int,
+    status: str,
+    reviewed_by_user_id: int
+) -> Optional[PendingReturn]:
+    """Set status to approved or rejected."""
+    from datetime import datetime
+    session = get_session()
+    try:
+        pr = session.query(PendingReturn).filter(PendingReturn.id == pending_id).first()
+        if not pr:
+            return None
+        pr.status = status
+        pr.reviewed_by_user_id = reviewed_by_user_id
+        pr.reviewed_at = datetime.now()
+        session.commit()
+        session.refresh(pr)
+        return pr
+    except Exception as e:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 # ============================================================================
 # DAO/Repository Functions for Asset
 # ============================================================================
@@ -701,7 +843,9 @@ def update_asset(
     code: Optional[str] = None,
     owner_user_id: Optional[int] = None,
     price: Optional[float] = None,
-    state: Optional[str] = None
+    state: Optional[str] = None,
+    first_income_photo_file_id: Optional[str] = None,
+    first_income_photo_at: Optional[datetime] = None
 ) -> Optional[Asset]:
     """Update asset information."""
     session = get_session()
@@ -709,7 +853,7 @@ def update_asset(
         asset = session.query(Asset).filter(Asset.id == asset_id).first()
         if not asset:
             return None
-        
+
         if name is not None:
             asset.name = name
         if qty is not None:
@@ -724,13 +868,82 @@ def update_asset(
             asset.price = price
         if state is not None:
             asset.state = state
-        
+        if first_income_photo_file_id is not None:
+            asset.first_income_photo_file_id = first_income_photo_file_id
+        if first_income_photo_at is not None:
+            asset.first_income_photo_at = first_income_photo_at
+
         session.commit()
         session.refresh(asset)
         return asset
     except Exception as e:
         session.rollback()
         raise
+    finally:
+        session.close()
+
+
+# ============================================================================
+# DAO: первая фото с прихода + пять последних фото при возврате
+# ============================================================================
+
+def set_asset_first_income_photo_if_empty(asset_id: int, photo_file_id: str) -> bool:
+    """Установить первую фото с прихода для актива, только если ещё не задана."""
+    session = get_session()
+    try:
+        asset = session.query(Asset).filter(Asset.id == asset_id).first()
+        if not asset or asset.first_income_photo_file_id:
+            return False
+        asset.first_income_photo_file_id = photo_file_id
+        asset.first_income_photo_at = datetime.now()
+        session.commit()
+        return True
+    except Exception as e:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def add_asset_return_photo(asset_id: int, photo_file_id: str, max_last: int = 5) -> None:
+    """Добавить фото при возврате на склад. Хранить не более max_last последних (по дате)."""
+    session = get_session()
+    try:
+        rec = AssetReturnPhoto(asset_id=asset_id, photo_file_id=photo_file_id)
+        session.add(rec)
+        session.commit()
+        # Удалить самые старые, если записей больше max_last
+        all_ids = [
+            row[0] for row in
+            session.query(AssetReturnPhoto.id)
+            .filter(AssetReturnPhoto.asset_id == asset_id)
+            .order_by(AssetReturnPhoto.photo_at.asc())
+            .all()
+        ]
+        if len(all_ids) > max_last:
+            to_delete = all_ids[: len(all_ids) - max_last]
+            session.query(AssetReturnPhoto).filter(
+                AssetReturnPhoto.id.in_(to_delete)
+            ).delete(synchronize_session=False)
+            session.commit()
+    except Exception as e:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_asset_return_photos(asset_id: int, limit: int = 5) -> list:
+    """Получить последние фото при возврате (по дате, новые первые)."""
+    session = get_session()
+    try:
+        return (
+            session.query(AssetReturnPhoto)
+            .filter(AssetReturnPhoto.asset_id == asset_id)
+            .order_by(AssetReturnPhoto.photo_at.desc())
+            .limit(limit)
+            .all()
+        )
     finally:
         session.close()
 
@@ -899,14 +1112,18 @@ def update_operation_signature(
 
 
 def get_unsigned_outgoing_operations() -> list[Operation]:
-    """Get all outgoing operations that haven't been signed yet and are older than 24 hours."""
+    """Get all outgoing/transfer operations that haven't been signed yet and are older than 24 hours.
+    Used for auto-sign: if recipient didn't confirm and didn't complain, after 24h count as received.
+    """
     from datetime import datetime, timedelta
     session = get_session()
     try:
-        # Get operations that are unsigned and older than 24 hours
         cutoff_time = datetime.now() - timedelta(hours=24)
         return session.query(Operation).filter(
-            Operation.type == OperationType.OUTGOING.value,
+            Operation.type.in_([
+                OperationType.OUTGOING.value,
+                OperationType.TRANSFER.value,
+            ]),
             Operation.signed_at.is_(None),
             Operation.timestamp <= cutoff_time
         ).all()
@@ -975,6 +1192,36 @@ def get_available_asset_instances(asset_id: int, limit: Optional[int] = None) ->
         session.close()
 
 
+def get_asset_instances_assigned_to_user(
+    user_id: int,
+    asset_id: Optional[int] = None,
+    limit: Optional[int] = None
+) -> list[AssetInstance]:
+    """Get instances assigned to a user (for transfer/return). Optionally filter by asset_id."""
+    from sqlalchemy.orm import joinedload
+
+    session = get_session()
+    try:
+        query = (
+            session.query(AssetInstance)
+            .options(joinedload(AssetInstance.asset))
+            .filter(AssetInstance.assigned_to_user_id == user_id)
+        )
+        if asset_id is not None:
+            query = query.filter(AssetInstance.asset_id == asset_id)
+        query = query.order_by(AssetInstance.id)
+        if limit is not None:
+            query = query.limit(limit)
+        instances = query.all()
+        for inst in instances:
+            if inst.asset:
+                _ = inst.asset.name
+        session.expunge_all()
+        return instances
+    finally:
+        session.close()
+
+
 def get_asset_instance_by_id(instance_id: int) -> Optional[AssetInstance]:
     """Get asset instance by ID."""
     session = get_session()
@@ -1004,25 +1251,29 @@ def get_next_instance_number(asset_id: int) -> int:
         session.close()
 
 
+# Специальное значение: "не менять поле" (отличие от явного None = сбросить назначение)
+_OMIT = object()
+
+
 def update_asset_instance(
     instance_id: int,
     distinctive_features: Optional[str] = None,
     state: Optional[str] = None,
-    assigned_to_user_id: Optional[int] = None,
+    assigned_to_user_id: Optional[int] = _OMIT,
     photo_file_id: Optional[str] = None
 ) -> Optional[AssetInstance]:
-    """Update asset instance information."""
+    """Update asset instance information. assigned_to_user_id=None сбрасывает назначение (возврат на склад)."""
     session = get_session()
     try:
         instance = session.query(AssetInstance).filter(AssetInstance.id == instance_id).first()
         if not instance:
             return None
-        
+
         if distinctive_features is not None:
             instance.distinctive_features = distinctive_features
         if state is not None:
             instance.state = state
-        if assigned_to_user_id is not None:
+        if assigned_to_user_id is not _OMIT:
             instance.assigned_to_user_id = assigned_to_user_id
         if photo_file_id is not None:
             instance.photo_file_id = photo_file_id
@@ -1068,10 +1319,12 @@ def test_db():
     
     # Test Asset operations
     print("\n--- Testing Asset operations ---")
+    category = get_category_by_name("Инструмент")  # from init_db seed
+    category_id = category.id if category else None
     asset = create_asset(
         name="Test Asset",
         qty=10.0,
-        category="tool",
+        category_id=category_id,
         code="TEST-001",
         price=100.0
     )

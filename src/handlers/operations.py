@@ -2,6 +2,7 @@
 import logging
 from datetime import datetime
 from aiogram import Router, F, Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.fsm.context import FSMContext
@@ -27,14 +28,23 @@ from src.services.db import (
     create_asset_instance,
     get_next_instance_number,
     get_available_asset_instances,
+    get_asset_instances_assigned_to_user,
     update_asset_instance,
     update_operation_signature,
     get_unsigned_outgoing_operations,
     get_asset_instances_by_asset_id,
-    get_operation_by_id
+    get_operation_by_id,
+    get_return_approver,
+    create_pending_return,
+    get_pending_return_by_id,
+    update_pending_return_status,
+    set_asset_first_income_photo_if_empty,
+    add_asset_return_photo,
 )
 from src.states.income import IncomeStates
 from src.states.outgoing import OutgoingStates
+from src.states.transfer import TransferStates
+from src.states.return_op import ReturnStates
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -335,6 +345,41 @@ async def skip_photo(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.message(IncomeStates.waiting_for_photo_mode, F.photo)
+@router.message(IncomeStates.waiting_for_photo_mode, F.document)
+async def income_photo_before_mode(message: Message, state: FSMContext):
+    """Если пользователь отправил фото до выбора режима — считаем как «одна фото на партию»."""
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        file_id = message.document.file_id
+    if not file_id:
+        await message.answer(
+            "❌ Отправьте изображение (фото или файл-картинку) или выберите режим выше."
+        )
+        return
+    await state.update_data(photo_mode="batch", batch_photo_file_id=file_id)
+    await state.set_state(IncomeStates.waiting_for_batch_price)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⏭️ Пропустить цену", callback_data="skip_batch_price")
+    await message.answer(
+        "✅ Фото загружено и будет привязано ко всем экземплярам\n\n"
+        "Введите учетную цену за единицу в рублях (например: 1500.50):",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+
+
+@router.message(IncomeStates.waiting_for_photo_mode)
+async def income_photo_mode_other(message: Message, state: FSMContext):
+    """Любое другое сообщение в выборе режима фото — подсказка."""
+    await message.answer(
+        "Выберите режим добавления фото кнопкой выше или отправьте одно фото — "
+        "оно будет привязано ко всей партии."
+    )
+
+
 @router.message(IncomeStates.waiting_for_batch_price)
 async def process_batch_price(message: Message, state: FSMContext):
     """Process price input after batch photo."""
@@ -380,69 +425,100 @@ async def skip_batch_price(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(IncomeStates.waiting_for_batch_photo, F.photo)
+@router.message(IncomeStates.waiting_for_batch_photo, F.document)
 async def process_batch_photo(message: Message, state: FSMContext):
-    """Process batch photo (one photo for all instances)."""
-    photo_file_id = message.photo[-1].file_id  # Get highest resolution photo
-    await state.update_data(batch_photo_file_id=photo_file_id)
-    await state.set_state(IncomeStates.waiting_for_batch_price)
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⏭️ Пропустить цену", callback_data="skip_batch_price")
-    
-    await message.answer(
-        "✅ Фото загружено и будет привязано ко всем экземплярам\n\n"
-        "Введите учетную цену за единицу в рублях (например: 1500.50):",
-        parse_mode="HTML",
-        reply_markup=builder.as_markup()
-    )
+    """Process batch photo (one photo for all instances). Принимаем и фото, и файл-картинку."""
+    try:
+        photo_file_id = None
+        if message.photo:
+            photo_file_id = message.photo[-1].file_id
+        elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+            photo_file_id = message.document.file_id
+        if not photo_file_id:
+            await message.answer(
+                "❌ Отправьте изображение (фото из галереи/камеры или файл-картинку) или нажмите «Пропустить»."
+            )
+            return
+        await state.update_data(batch_photo_file_id=photo_file_id)
+        await state.set_state(IncomeStates.waiting_for_batch_price)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⏭️ Пропустить цену", callback_data="skip_batch_price")
+        await message.answer(
+            "✅ Фото загружено и будет привязано ко всем экземплярам\n\n"
+            "Введите учетную цену за единицу в рублях (например: 1500.50):",
+            parse_mode="HTML",
+            reply_markup=builder.as_markup()
+        )
+    except Exception as e:
+        logger.exception("process_batch_photo error: %s", e)
+        await message.answer(
+            "❌ Не удалось обработать фото. Попробуйте отправить ещё раз или нажмите «Пропустить»."
+        )
 
 
 @router.message(IncomeStates.waiting_for_batch_photo)
 async def process_batch_photo_text(message: Message, state: FSMContext):
     """Handle text when batch photo expected."""
     await message.answer(
-        "❌ Пожалуйста, отправьте фото или нажмите 'Пропустить'."
+        "❌ Пожалуйста, отправьте фото (или файл-картинку) или нажмите «Пропустить»."
     )
 
 
 @router.message(IncomeStates.waiting_for_instance_photo, F.photo)
+@router.message(IncomeStates.waiting_for_instance_photo, F.document)
 async def process_instance_photo(message: Message, state: FSMContext):
-    """Process photo for individual instance."""
-    data = await state.get_data()
-    instances = data.get('instances', [])
-    current_index = data.get('current_instance_index', 0)
-    
-    photo_file_id = message.photo[-1].file_id
-    
-    # Initialize instance_photos dict if not exists
-    if 'instance_photos' not in data:
-        data['instance_photos'] = {}
-    
-    instance_photos = data['instance_photos']
-    instance_photos[current_index] = photo_file_id
-    await state.update_data(instance_photos=instance_photos)
-    
-    # Move to price input for this instance
-    await state.set_state(IncomeStates.waiting_for_instance_price)
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⏭️ Пропустить цену", callback_data="skip_instance_price")
-    
-    await message.answer(
-        f"✅ Фото для экземпляра #{current_index + 1}: <b>{instances[current_index]}</b>\n\n"
-        "Введите учетную цену для этого экземпляра в рублях (например: 1500.50):",
-        parse_mode="HTML",
-        reply_markup=builder.as_markup()
-    )
+    """Process photo for individual instance. Принимаем и фото, и файл-картинку."""
+    try:
+        data = await state.get_data()
+        instances = data.get('instances', [])
+        current_index = data.get('current_instance_index', 0)
+        if not instances or current_index >= len(instances):
+            await message.answer("❌ Ошибка состояния. Начните приход заново (/start → Приход имущества).")
+            await state.clear()
+            return
+        photo_file_id = None
+        if message.photo:
+            photo_file_id = message.photo[-1].file_id
+        elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+            photo_file_id = message.document.file_id
+        if not photo_file_id:
+            await message.answer(
+                "❌ Отправьте изображение (фото или файл-картинку) или нажмите «Пропустить для этого экземпляра»."
+            )
+            return
+        if 'instance_photos' not in data:
+            data['instance_photos'] = {}
+        instance_photos = dict(data['instance_photos'])
+        instance_photos[current_index] = photo_file_id
+        await state.update_data(instance_photos=instance_photos)
+        await state.set_state(IncomeStates.waiting_for_instance_price)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⏭️ Пропустить цену", callback_data="skip_instance_price")
+        await message.answer(
+            f"✅ Фото для экземпляра #{current_index + 1}: <b>{instances[current_index]}</b>\n\n"
+            "Введите учетную цену для этого экземпляра в рублях (например: 1500.50):",
+            parse_mode="HTML",
+            reply_markup=builder.as_markup()
+        )
+    except Exception as e:
+        logger.exception("process_instance_photo error: %s", e)
+        await message.answer(
+            "❌ Не удалось обработать фото. Отправьте ещё раз или нажмите «Пропустить для этого экземпляра»."
+        )
 
 
 @router.message(IncomeStates.waiting_for_instance_price)
 async def process_instance_price(message: Message, state: FSMContext):
     """Process price input for individual instance."""
+    if not message.text or not message.text.strip():
+        await message.answer(
+            "❌ Нужно ввести цену числом (например: 1500.50). Отправьте текстовое сообщение."
+        )
+        return
     data = await state.get_data()
     instances = data.get('instances', [])
     current_index = data.get('current_instance_index', 0)
-    
+
     try:
         # Replace comma with dot and parse as float
         price_str = message.text.strip().replace(",", ".")
@@ -590,9 +666,9 @@ async def skip_instance_photo(callback: CallbackQuery, state: FSMContext):
 
 @router.message(IncomeStates.waiting_for_instance_photo)
 async def process_instance_photo_text(message: Message, state: FSMContext):
-    """Handle text when instance photo expected."""
+    """Handle text or other content when instance photo expected."""
     await message.answer(
-        "❌ Пожалуйста, отправьте фото или нажмите 'Пропустить для этого экземпляра'."
+        "❌ Пожалуйста, отправьте фото (или файл-картинку) или нажмите «Пропустить для этого экземпляра»."
     )
 
 
@@ -804,6 +880,10 @@ async def confirm_income(callback: CallbackQuery, state: FSMContext):
             # Use first available individual photo
             operation_photo_file_id = next((v for v in instance_photos.values() if v is not None), None)
         
+        # Установить первую фото с прихода у актива, если ещё не задана
+        if operation_photo_file_id:
+            set_asset_first_income_photo_if_empty(asset.id, operation_photo_file_id)
+
         operation = create_operation(
             type=OperationType.INCOMING.value,
             asset_id=asset.id,
@@ -1317,18 +1397,22 @@ async def confirm_outgoing(callback: CallbackQuery, state: FSMContext):
             "Попробуйте начать операцию заново или обратитесь к администратору."
         )
         
-        # Check if message has photo
-        if callback.message.photo:
-            await callback.message.edit_caption(
-                caption=error_text,
-                parse_mode="HTML"
-            )
-        else:
-            await callback.message.edit_text(
-                error_text,
-                parse_mode="HTML"
-            )
-    
+        # Check if message has photo; игнорируем "message is not modified" при повторном нажатии
+        try:
+            if callback.message.photo:
+                await callback.message.edit_caption(
+                    caption=error_text,
+                    parse_mode="HTML"
+                )
+            else:
+                await callback.message.edit_text(
+                    error_text,
+                    parse_mode="HTML"
+                )
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                raise
+
     await state.clear()
 
 
@@ -1340,88 +1424,99 @@ async def send_recipient_notification(
     qty: int,
     instances: list
 ):
-    """Send notification to recipient about received assets."""
+    """Send notification to recipient about received assets. Allгда отправляем отдельное сообщение с кнопкой «Имущество получил»."""
     recipient_user = get_user_by_id(recipient_id)
     if not recipient_user:
         logger.error(f"Recipient user {recipient_id} not found")
         return
-    
-    # Get operation to get price and from_user (manager)
+    if not recipient_user.telegram_id:
+        logger.error(f"Recipient user {recipient_id} has no telegram_id")
+        return
+
     operation = get_operation_by_id(operation_id)
     if not operation:
         logger.error(f"Operation {operation_id} not found")
         return
-    
-    # Get manager (from_user) information
-    manager_user = None
-    manager_link = ""
+
+    is_transfer = operation.type == OperationType.TRANSFER.value
+    manager_link = "начальнику лично"
     if operation.from_user_id:
-        manager_user = get_user_by_id(operation.from_user_id)
-        if manager_user:
-            # Create Telegram deep link for private message
-            manager_link = f'<a href="tg://user?id={manager_user.telegram_id}">начальнику лично</a>'
-        else:
-            manager_link = "начальнику лично"
-    else:
-        manager_link = "начальнику лично"
-    
-    # Get price per unit (from operation or from instances)
+        from_user = get_user_by_id(operation.from_user_id)
+        if from_user and from_user.telegram_id:
+            manager_link = f'<a href="tg://user?id={from_user.telegram_id}">начальнику лично</a>'
+
     price_per_unit = None
     if operation.price is not None:
         price_per_unit = operation.price
-    elif instances and instances[0].price is not None:
+    elif instances and len(instances) > 0 and getattr(instances[0], "price", None) is not None:
         price_per_unit = instances[0].price
-    
-    # Build message text
-    instances_text = "\n".join([
-        f"  • {inst.distinctive_features}" for inst in instances
-    ])
-    
+
+    instances_text = ""
+    if instances:
+        instances_text = "\n".join([
+            f"  • {getattr(inst, 'distinctive_features', str(inst))}" for inst in instances
+        ])
+    else:
+        instances_text = "  —"
+
     price_text = ""
     if price_per_unit is not None:
         price_text = f"\n<b>Цена за единицу:</b> {price_per_unit:.2f} руб."
-    
+
+    if is_transfer:
+        header = "📦 <b>Вам передали имущество</b> (передача от сотрудника)\n\n"
+    else:
+        header = "📦 <b>Вам передано имущество</b>\n\n"
+
     message_text = (
-        "📦 <b>Вам передано имущество</b>\n\n"
+        f"{header}"
         f"<b>Наименование:</b> {asset_name}\n"
         f"<b>Количество:</b> {qty}{price_text}\n\n"
         f"<b>Экземпляры:</b>\n{instances_text}\n\n"
         "Вы несете ответственность за сохранность переданного имущества.\n\n"
         f"Если вы не согласны с передачей, обратитесь к {manager_link}.\n\n"
-        "Подтвердите получение имущества:"
+        "Подтвердите получение — нажмите кнопку ниже:"
     )
-    
-    # Build keyboard with confirmation button
+
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Имущество получил", callback_data=f"confirm_receipt_{operation_id}")
     builder.adjust(1)
-    
-    # Get first instance photo if available
-    photo_file_id = None
-    for instance in instances:
-        if instance.photo_file_id:
-            photo_file_id = instance.photo_file_id
-            break
-    
+    markup = builder.as_markup()
+
+    chat_id = recipient_user.telegram_id
     try:
+        photo_file_id = None
+        if instances:
+            for instance in instances:
+                fid = getattr(instance, "photo_file_id", None)
+                if fid:
+                    photo_file_id = fid
+                    break
         if photo_file_id:
+            caption_short = (
+                f"📷 {asset_name}, {qty} шт.\n\n"
+                "Подробности и кнопка подтверждения — в следующем сообщении."
+            )
             await bot.send_photo(
-                chat_id=recipient_user.telegram_id,
+                chat_id=chat_id,
                 photo=photo_file_id,
-                caption=message_text,
-                parse_mode="HTML",
-                reply_markup=builder.as_markup()
+                caption=caption_short,
+                parse_mode="HTML"
             )
-        else:
-            await bot.send_message(
-                chat_id=recipient_user.telegram_id,
-                text=message_text,
-                parse_mode="HTML",
-                reply_markup=builder.as_markup()
-            )
-        logger.info(f"Sent receipt notification to recipient {recipient_id} for operation {operation_id}")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=message_text,
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+        logger.info(
+            f"Sent receipt notification to recipient id={recipient_id} telegram_id={chat_id} for operation {operation_id}"
+        )
     except Exception as e:
-        logger.error(f"Failed to send notification to recipient {recipient_id}: {e}", exc_info=True)
+        logger.error(
+            f"Failed to send notification to recipient {recipient_id} (telegram_id={chat_id}): {e}",
+            exc_info=True
+        )
 
 
 @router.callback_query(F.data.startswith("confirm_receipt_"))
@@ -1519,14 +1614,18 @@ async def writeoff_handler(message: Message):
     logger.info(f"User {message.from_user.id} started writeoff operation")
 
 
+# =============================================================================
+# Transfer (Передача имущества) — передача от одного пользователя другому
+# =============================================================================
+
 @router.message(F.text == "Передача имущества")
-async def transfer_handler(message: Message):
-    """Handle transfer operation."""
+async def transfer_handler(message: Message, state: FSMContext):
+    """Start transfer: show assets assigned to current user."""
     user = message.from_user
     if not user:
         await message.answer("Ошибка: не удалось получить информацию о пользователе")
         return
-    
+
     db_user = get_user_by_telegram_id(user.id)
     if not db_user or not check_user_registered(db_user.role):
         await message.answer(
@@ -1535,24 +1634,262 @@ async def transfer_handler(message: Message):
             "После одобрения вам будет предоставлен доступ к операциям."
         )
         return
-    
+
+    instances = get_asset_instances_assigned_to_user(db_user.id)
+    if not instances:
+        await message.answer(
+            "❌ <b>У вас нет переданного имущества</b>\n\n"
+            "Передавать можно только то имущество, которое уже выдано вам (операция «Расход»).",
+            parse_mode="HTML"
+        )
+        return
+
+    # Group by asset_id: { asset_id: (asset, count) }
+    by_asset = {}
+    for inst in instances:
+        aid = inst.asset_id
+        if aid not in by_asset:
+            by_asset[aid] = [inst.asset, 0]
+        by_asset[aid][1] += 1
+
+    await state.set_state(TransferStates.waiting_for_asset)
+    builder = InlineKeyboardBuilder()
+    for asset_id, (asset, count) in by_asset.items():
+        code_display = f" [{asset.code}]" if asset.code else ""
+        button_text = f"{asset.name}{code_display} (у вас: {count})"
+        if len(button_text) > 50:
+            button_text = button_text[:47] + "..."
+        builder.button(text=button_text, callback_data=f"transfer_asset_{asset_id}")
+    builder.adjust(1)
+
     await message.answer(
         "🔄 <b>Передача имущества</b>\n\n"
-        "Эта операция позволяет передать имущество между подразделениями или сотрудниками.\n\n"
-        "Функционал в разработке...",
+        "Выберите актив, который хотите передать другому пользователю:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    logger.info(f"User {user.id} started transfer operation")
+
+
+@router.callback_query(F.data.startswith("transfer_asset_"), TransferStates.waiting_for_asset)
+async def transfer_select_asset(callback: CallbackQuery, state: FSMContext):
+    """Store asset, show recipient list (excluding self). answer() в начале — иначе Telegram «query is too old»."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    asset_id = int(callback.data.split("_")[2])
+    asset = get_asset_by_id(asset_id)
+    if not asset:
+        await callback.message.edit_text("❌ Актив не найден.")
+        return
+
+    user = callback.from_user
+    db_user = get_user_by_telegram_id(user.id)
+    if not db_user:
+        await callback.message.edit_text("❌ Пользователь не найден.")
+        await state.clear()
+        return
+
+    my_instances = get_asset_instances_assigned_to_user(db_user.id, asset_id=asset_id)
+    if not my_instances:
+        await callback.message.edit_text("❌ У вас нет этого актива.")
+        return
+
+    my_count = len(my_instances)
+    await state.update_data(
+        asset_id=asset.id,
+        asset_name=asset.name,
+        transfer_my_count=my_count
+    )
+    await state.set_state(TransferStates.waiting_for_recipient)
+
+    users = get_all_users()
+    registered = [u for u in users if u.role != UserRole.UNKNOWN.value and u.id != db_user.id]
+    if not registered:
+        await callback.message.edit_text(
+            "❌ Нет других зарегистрированных пользователей для передачи."
+        )
+        await state.clear()
+        return
+
+    builder = InlineKeyboardBuilder()
+    for u in registered:
+        role_text = {
+            UserRole.SYSTEM_ADMIN.value: "Админ",
+            UserRole.MANAGER.value: "Менеджер",
+            UserRole.STOREKEEPER.value: "Кладовщик",
+            UserRole.FOREMAN.value: "Прораб",
+            UserRole.WORKER.value: "Рабочий"
+        }.get(u.role, u.role)
+        btn = f"{u.fullname} ({role_text})"
+        if len(btn) > 50:
+            btn = btn[:47] + "..."
+        builder.button(text=btn, callback_data=f"transfer_recipient_{u.id}")
+    builder.adjust(1)
+
+    await callback.message.edit_text(
+        f"✅ Актив: <b>{asset.name}</b>\n"
+        f"У вас: <b>{my_count}</b> шт.\n\n"
+        "Выберите получателя:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+
+
+@router.callback_query(F.data.startswith("transfer_recipient_"), TransferStates.waiting_for_recipient)
+async def transfer_select_recipient(callback: CallbackQuery, state: FSMContext):
+    """Store recipient, ask for quantity. answer() в начале — иначе Telegram «query is too old»."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    recipient_id = int(callback.data.split("_")[2])
+    recipient = get_user_by_id(recipient_id)
+    if not recipient:
+        await callback.message.edit_text("❌ Пользователь не найден.")
+        return
+
+    await state.update_data(recipient_id=recipient.id, recipient_name=recipient.fullname)
+    await state.set_state(TransferStates.waiting_for_qty)
+    data = await state.get_data()
+    my_count = data["transfer_my_count"]
+
+    await callback.message.edit_text(
+        f"✅ Получатель: <b>{recipient.fullname}</b>\n\n"
+        f"Введите количество для передачи (от 1 до {my_count}):",
         parse_mode="HTML"
     )
-    logger.info(f"User {message.from_user.id} started transfer operation")
 
+
+@router.message(TransferStates.waiting_for_qty)
+async def transfer_process_qty(message: Message, state: FSMContext):
+    """Validate qty, show confirmation."""
+    try:
+        qty = int(message.text.strip())
+        if qty < 1:
+            raise ValueError("qty < 1")
+    except ValueError:
+        await message.answer("❌ Введите целое число (например: 1 или 2):")
+        return
+
+    data = await state.get_data()
+    my_count = data["transfer_my_count"]
+    if qty > my_count:
+        await message.answer(
+            f"❌ У вас только <b>{my_count}</b> шт. Введите число от 1 до {my_count}:",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.update_data(qty=qty)
+    await state.set_state(TransferStates.waiting_for_confirm)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data="transfer_confirm")
+    builder.button(text="❌ Отменить", callback_data="transfer_cancel")
+    builder.adjust(1)
+
+    await message.answer(
+        "📋 <b>Подтверждение передачи</b>\n\n"
+        f"Актив: <b>{data['asset_name']}</b>\n"
+        f"Получатель: <b>{data['recipient_name']}</b>\n"
+        f"Количество: <b>{qty}</b>\n\n"
+        "Подтвердите операцию:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+
+
+@router.callback_query(F.data == "transfer_confirm", TransferStates.waiting_for_confirm)
+async def transfer_confirm(callback: CallbackQuery, state: FSMContext):
+    """Reassign instances to recipient, create operation type=transfer. answer() в начале — иначе «query is too old»."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    data = await state.get_data()
+    asset_id = data["asset_id"]
+    asset_name = data["asset_name"]
+    recipient_id = data["recipient_id"]
+    recipient_name = data["recipient_name"]
+    qty = data["qty"]
+
+    user = callback.from_user
+    db_user = get_user_by_telegram_id(user.id)
+    if not db_user:
+        await callback.message.edit_text("❌ Пользователь не найден.")
+        await state.clear()
+        return
+
+    instances = get_asset_instances_assigned_to_user(db_user.id, asset_id=asset_id, limit=int(qty))
+    if len(instances) < int(qty):
+        await callback.message.edit_text("❌ Недостаточно экземпляров.")
+        await state.clear()
+        return
+
+    try:
+        transferred_instances = instances[: int(qty)]
+        for inst in transferred_instances:
+            update_asset_instance(
+                instance_id=inst.id,
+                assigned_to_user_id=recipient_id,
+                state=AssetState.IN_USE.value
+            )
+        operation = create_operation(
+            type=OperationType.TRANSFER.value,
+            asset_id=asset_id,
+            qty=float(qty),
+            from_user_id=db_user.id,
+            to_user_id=recipient_id,
+            comment=f"Передача: {asset_name}"
+        )
+        await callback.message.edit_text(
+            "✅ <b>Передача выполнена</b>\n\n"
+            f"Актив: <b>{asset_name}</b>\n"
+            f"Получатель: <b>{recipient_name}</b>\n"
+            f"Количество: <b>{qty}</b>\n\n"
+            "Получателю отправлено уведомление. Он должен нажать «Имущество получил». "
+            "Если не подтвердит и не пожалуется начальнику — через 24 часа имущество автоматически будет числиться на нём.",
+            parse_mode="HTML"
+        )
+        logger.info(f"Transfer: user {db_user.id} -> {recipient_id}, asset_id={asset_id}, qty={qty}")
+
+        # Уведомить получателя: сообщение + кнопка «Имущество получил»; через 24 ч — авто-подпись
+        await send_recipient_notification(
+            bot=callback.bot,
+            operation_id=operation.id,
+            recipient_id=recipient_id,
+            asset_name=asset_name,
+            qty=qty,
+            instances=transferred_instances
+        )
+    except Exception as e:
+        logger.error(f"Transfer error: {e}", exc_info=True)
+        await callback.message.edit_text("❌ Ошибка при сохранении операции.")
+    await state.clear()
+
+
+@router.callback_query(F.data == "transfer_cancel", TransferStates.waiting_for_confirm)
+async def transfer_cancel(callback: CallbackQuery, state: FSMContext):
+    """Cancel transfer."""
+    await state.clear()
+    await callback.message.edit_text("❌ Передача отменена.")
+    await callback.answer()
+
+
+# =============================================================================
+# Return (Возврат имущества) — возврат на склад
+# =============================================================================
 
 @router.message(F.text == "Возврат имущества")
-async def return_handler(message: Message):
-    """Handle return operation."""
+async def return_handler(message: Message, state: FSMContext):
+    """Start return: show assets assigned to current user."""
     user = message.from_user
     if not user:
         await message.answer("Ошибка: не удалось получить информацию о пользователе")
         return
-    
+
     db_user = get_user_by_telegram_id(user.id)
     if not db_user or not check_user_registered(db_user.role):
         await message.answer(
@@ -1561,11 +1898,448 @@ async def return_handler(message: Message):
             "После одобрения вам будет предоставлен доступ к операциям."
         )
         return
-    
+
+    instances = get_asset_instances_assigned_to_user(db_user.id)
+    if not instances:
+        await message.answer(
+            "❌ <b>У вас нет имущества для возврата</b>\n\n"
+            "Возвращать можно только то имущество, которое выдано вам (операция «Расход»).",
+            parse_mode="HTML"
+        )
+        return
+
+    by_asset = {}
+    for inst in instances:
+        aid = inst.asset_id
+        if aid not in by_asset:
+            by_asset[aid] = [inst.asset, 0]
+        by_asset[aid][1] += 1
+
+    await state.set_state(ReturnStates.waiting_for_asset)
+    builder = InlineKeyboardBuilder()
+    for asset_id, (asset, count) in by_asset.items():
+        code_display = f" [{asset.code}]" if asset.code else ""
+        button_text = f"{asset.name}{code_display} (у вас: {count})"
+        if len(button_text) > 50:
+            button_text = button_text[:47] + "..."
+        builder.button(text=button_text, callback_data=f"return_asset_{asset_id}")
+    builder.adjust(1)
+
     await message.answer(
-        "↩️ <b>Возврат имущества</b>\n\n"
-        "Эта операция позволяет зарегистрировать возврат имущества на склад.\n\n"
-        "Функционал в разработке...",
+        "↩️ <b>Возврат имущества на склад</b>\n\n"
+        "Выберите актив, который хотите вернуть на склад:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    logger.info(f"User {user.id} started return operation")
+
+
+@router.callback_query(F.data.startswith("return_asset_"), ReturnStates.waiting_for_asset)
+async def return_select_asset(callback: CallbackQuery, state: FSMContext):
+    """Store asset, ask quantity to return. answer() в начале — иначе Telegram «query is too old»."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    asset_id = int(callback.data.split("_")[2])
+    asset = get_asset_by_id(asset_id)
+    if not asset:
+        await callback.message.edit_text("❌ Актив не найден.")
+        return
+
+    user = callback.from_user
+    db_user = get_user_by_telegram_id(user.id)
+    if not db_user:
+        await callback.message.edit_text("❌ Пользователь не найден.")
+        await state.clear()
+        return
+
+    my_instances = get_asset_instances_assigned_to_user(db_user.id, asset_id=asset_id)
+    if not my_instances:
+        await callback.message.edit_text("❌ У вас нет этого актива.")
+        return
+
+    my_count = len(my_instances)
+    await state.update_data(
+        asset_id=asset.id,
+        asset_name=asset.name,
+        return_my_count=my_count
+    )
+    await state.set_state(ReturnStates.waiting_for_qty)
+
+    await callback.message.edit_text(
+        f"✅ Актив: <b>{asset.name}</b>\n"
+        f"У вас: <b>{my_count}</b> шт.\n\n"
+        f"Введите количество для возврата на склад (от 1 до {my_count}):",
         parse_mode="HTML"
     )
-    logger.info(f"User {message.from_user.id} started return operation")
+
+
+@router.message(ReturnStates.waiting_for_qty)
+async def return_process_qty(message: Message, state: FSMContext):
+    """Validate qty, show confirmation."""
+    try:
+        qty = int(message.text.strip())
+        if qty < 1:
+            raise ValueError("qty < 1")
+    except ValueError:
+        await message.answer("❌ Введите целое число (например: 1 или 2):")
+        return
+
+    data = await state.get_data()
+    my_count = data["return_my_count"]
+    if qty > my_count:
+        await message.answer(
+            f"❌ У вас только <b>{my_count}</b> шт. Введите число от 1 до {my_count}:",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.update_data(qty=qty)
+    await state.set_state(ReturnStates.waiting_for_confirm)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить возврат", callback_data="return_confirm")
+    builder.button(text="❌ Отменить", callback_data="return_cancel")
+    builder.adjust(1)
+
+    await message.answer(
+        "📋 <b>Подтверждение возврата на склад</b>\n\n"
+        f"Актив: <b>{data['asset_name']}</b>\n"
+        f"Количество: <b>{qty}</b>\n\n"
+        "Подтвердите операцию:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+
+
+@router.callback_query(F.data == "return_confirm", ReturnStates.waiting_for_confirm)
+async def return_confirm(callback: CallbackQuery, state: FSMContext):
+    """Создать запрос на возврат и отправить на подтверждение кладовщику или главному администратору."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    data = await state.get_data()
+    asset_id = data["asset_id"]
+    asset_name = data["asset_name"]
+    qty = data["qty"]
+
+    user = callback.from_user
+    db_user = get_user_by_telegram_id(user.id)
+    if not db_user:
+        await callback.message.edit_text("❌ Пользователь не найден.")
+        await state.clear()
+        return
+
+    instances = get_asset_instances_assigned_to_user(db_user.id, asset_id=asset_id, limit=int(qty))
+    if len(instances) < int(qty):
+        await callback.message.edit_text("❌ Недостаточно экземпляров.")
+        await state.clear()
+        return
+
+    approver = get_return_approver()
+    if not approver:
+        await callback.message.edit_text(
+            "❌ В системе нет назначенного кладовщика или главного администратора. "
+            "Обратитесь к администратору для настройки прав."
+        )
+        await state.clear()
+        return
+
+    try:
+        pending = create_pending_return(
+            from_user_id=db_user.id,
+            asset_id=asset_id,
+            asset_name=asset_name,
+            qty=float(qty)
+        )
+    except Exception as e:
+        logger.exception("create_pending_return: %s", e)
+        await callback.message.edit_text("❌ Ошибка при создании запроса. Попробуйте позже.")
+        await state.clear()
+        return
+
+    approver_role = "Кладовщик" if approver.role == UserRole.STOREKEEPER.value else "Главный администратор"
+    text_to_approver = (
+        "↩️ <b>Запрос на возврат на склад</b>\n\n"
+        f"<b>От кого:</b> {db_user.fullname}\n"
+        f"<b>Актив:</b> {asset_name}\n"
+        f"<b>Количество:</b> {int(qty)}\n\n"
+        f"Подтвердите или отклоните возврат (вы — {approver_role}):"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить возврат", callback_data=f"approve_return_{pending.id}")
+    builder.button(text="❌ Отклонить", callback_data=f"reject_return_{pending.id}")
+    builder.adjust(1)
+
+    try:
+        await callback.bot.send_message(
+            chat_id=approver.telegram_id,
+            text=text_to_approver,
+            parse_mode="HTML",
+            reply_markup=builder.as_markup()
+        )
+    except Exception as e:
+        logger.exception("Notify approver: %s", e)
+        await callback.message.edit_text(
+            "❌ Не удалось отправить запрос подтверждающему. Попробуйте позже."
+        )
+        await state.clear()
+        return
+
+    await callback.message.edit_text(
+        "⏳ <b>Запрос на возврат отправлен</b>\n\n"
+        f"<b>Актив:</b> {asset_name}\n"
+        f"<b>Количество:</b> {qty}\n\n"
+        "Ожидайте подтверждения кладовщика или главного администратора.\n"
+        "Вам придёт уведомление после решения.",
+        parse_mode="HTML"
+    )
+    await state.clear()
+    logger.info(f"Return request {pending.id} from user {db_user.id} sent to approver {approver.id}")
+
+
+@router.callback_query(F.data == "return_cancel", ReturnStates.waiting_for_confirm)
+async def return_cancel(callback: CallbackQuery, state: FSMContext):
+    """Cancel return."""
+    await state.clear()
+    await callback.message.edit_text("❌ Возврат отменён.")
+    await callback.answer()
+
+
+def _can_approve_return(user_role: str) -> bool:
+    """Право подтверждать возврат: кладовщик или системный администратор."""
+    return user_role in (UserRole.STOREKEEPER.value, UserRole.SYSTEM_ADMIN.value)
+
+
+def _do_approve_return(pending, db_user_id: int, from_user, message_edit_func, bot, photo_file_id: str = None) -> bool:
+    """Выполнить подтверждение возврата: экземпляры, qty, операция, статус. Возвращает True при успехе."""
+    pending_id = pending.id
+    instances = get_asset_instances_assigned_to_user(pending.from_user_id, asset_id=pending.asset_id, limit=int(pending.qty))
+    if len(instances) < int(pending.qty):
+        update_pending_return_status(pending_id, "rejected", db_user_id)
+        return False
+    asset = get_asset_by_id(pending.asset_id)
+    if not asset:
+        return False
+    if photo_file_id:
+        add_asset_return_photo(pending.asset_id, photo_file_id)
+    for inst in instances[: int(pending.qty)]:
+        update_asset_instance(
+            instance_id=inst.id,
+            assigned_to_user_id=None,
+            state=AssetState.IN_STOCK.value
+        )
+    new_qty = asset.qty + int(pending.qty)
+    update_asset(asset_id=pending.asset_id, qty=new_qty)
+    create_operation(
+        type=OperationType.RETURN.value,
+        asset_id=pending.asset_id,
+        qty=pending.qty,
+        from_user_id=pending.from_user_id,
+        to_user_id=None,
+        comment=f"Возврат на склад: {pending.asset_name} (подтверждён кладовщиком/админом)"
+    )
+    update_pending_return_status(pending_id, "approved", db_user_id)
+    return True
+
+
+@router.callback_query(F.data.startswith("approve_return_"))
+async def approve_return_callback(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение возврата кладовщиком (с фото) или главным администратором (без фото)."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    pending_id = int(callback.data.split("_")[2])
+    pending = get_pending_return_by_id(pending_id)
+    if not pending:
+        await callback.message.edit_text("❌ Запрос не найден или уже обработан.")
+        return
+    if pending.status != "pending":
+        await callback.message.edit_text("❌ Этот запрос уже обработан.")
+        return
+
+    db_user = get_user_by_telegram_id(callback.from_user.id)
+    if not db_user or not _can_approve_return(db_user.role):
+        await callback.message.edit_text("❌ У вас нет прав подтверждать возврат на склад.")
+        return
+
+    approver = get_return_approver()
+    if not approver or approver.id != db_user.id:
+        await callback.message.edit_text("❌ Подтверждать может только назначенный кладовщик или главный администратор.")
+        return
+
+    from_user = get_user_by_id(pending.from_user_id)
+    instances = get_asset_instances_assigned_to_user(pending.from_user_id, asset_id=pending.asset_id, limit=int(pending.qty))
+    if len(instances) < int(pending.qty):
+        update_pending_return_status(pending_id, "rejected", db_user.id)
+        await callback.message.edit_text(
+            "❌ Отклонено: у пользователя недостаточно экземпляров для возврата (возможно, часть уже передана)."
+        )
+        if from_user:
+            try:
+                await callback.bot.send_message(
+                    from_user.telegram_id,
+                    "↩️ <b>Возврат на склад отклонён</b>\n\n"
+                    f"Недостаточно экземпляров.\n<b>Актив:</b> {pending.asset_name}",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        return
+
+    # Кладовщик обязан прислать фото перед подтверждением; главный администратор — нет
+    if db_user.role == UserRole.STOREKEEPER.value:
+        await callback.message.edit_text(
+            "📷 <b>Подтверждение возврата</b>\n\nОтправьте фото товара для привязки к возврату.",
+            parse_mode="HTML"
+        )
+        await state.set_state(ReturnStates.waiting_for_storekeeper_photo)
+        await state.update_data(pending_return_id=pending_id)
+        return
+
+    # Главный администратор — подтверждаем сразу без фото
+    try:
+        ok = _do_approve_return(pending, db_user.id, from_user, callback.message.edit_text, callback.bot, photo_file_id=None)
+        if not ok:
+            await callback.message.edit_text("❌ Ошибка при выполнении возврата.")
+            return
+    except Exception as e:
+        logger.exception("approve_return: %s", e)
+        await callback.message.edit_text("❌ Ошибка при выполнении возврата.")
+        return
+
+    await callback.message.edit_text(
+        "✅ <b>Возврат на склад подтверждён</b>\n\n"
+        f"<b>Актив:</b> {pending.asset_name}\n"
+        f"<b>Количество:</b> {int(pending.qty)}\n"
+        f"<b>От пользователя:</b> {from_user.fullname if from_user else '?'}",
+        parse_mode="HTML"
+    )
+    if from_user:
+        try:
+            await callback.bot.send_message(
+                from_user.telegram_id,
+                "✅ <b>Возврат на склад подтверждён</b>\n\n"
+                f"<b>Актив:</b> {pending.asset_name}\n"
+                f"<b>Количество:</b> {int(pending.qty)}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    logger.info(f"Return approved: pending_id={pending_id}, approver={db_user.id}")
+
+
+@router.message(ReturnStates.waiting_for_storekeeper_photo, F.photo)
+async def storekeeper_return_photo_handler(message: Message, state: FSMContext):
+    """Приём фото от кладовщика и подтверждение возврата на склад."""
+    db_user = get_user_by_telegram_id(message.from_user.id)
+    if not db_user or db_user.role != UserRole.STOREKEEPER.value:
+        await state.clear()
+        await message.answer("❌ У вас нет прав. Ожидалось фото от кладовщика.")
+        return
+    approver = get_return_approver()
+    if not approver or approver.id != db_user.id:
+        await state.clear()
+        await message.answer("❌ Подтверждать возврат может только назначенный кладовщик.")
+        return
+
+    data = await state.get_data()
+    pending_id = data.get("pending_return_id")
+    if not pending_id:
+        await state.clear()
+        await message.answer("❌ Сессия истекла. Начните подтверждение возврата заново.")
+        return
+
+    pending = get_pending_return_by_id(pending_id)
+    if not pending or pending.status != "pending":
+        await state.clear()
+        await message.answer("❌ Запрос не найден или уже обработан.")
+        return
+
+    photo_file_id = message.photo[-1].file_id
+    from_user = get_user_by_id(pending.from_user_id)
+
+    try:
+        ok = _do_approve_return(pending, db_user.id, from_user, None, message.bot, photo_file_id=photo_file_id)
+        await state.clear()
+        if not ok:
+            await message.answer("❌ Ошибка при выполнении возврата.")
+            return
+    except Exception as e:
+        logger.exception("storekeeper_return_photo: %s", e)
+        await state.clear()
+        await message.answer("❌ Ошибка при выполнении возврата.")
+        return
+
+    await message.answer(
+        "✅ <b>Возврат на склад подтверждён</b>\n\n"
+        f"<b>Актив:</b> {pending.asset_name}\n"
+        f"<b>Количество:</b> {int(pending.qty)}\n"
+        f"<b>От пользователя:</b> {from_user.fullname if from_user else '?'}",
+        parse_mode="HTML"
+    )
+    if from_user:
+        try:
+            await message.bot.send_message(
+                from_user.telegram_id,
+                "✅ <b>Возврат на склад подтверждён</b>\n\n"
+                f"<b>Актив:</b> {pending.asset_name}\n"
+                f"<b>Количество:</b> {int(pending.qty)}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    logger.info(f"Return approved with photo: pending_id={pending_id}, approver={db_user.id}")
+
+
+@router.callback_query(F.data.startswith("reject_return_"))
+async def reject_return_callback(callback: CallbackQuery):
+    """Отклонение возврата кладовщиком или главным администратором."""
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    pending_id = int(callback.data.split("_")[2])
+    pending = get_pending_return_by_id(pending_id)
+    if not pending:
+        await callback.message.edit_text("❌ Запрос не найден или уже обработан.")
+        return
+    if pending.status != "pending":
+        await callback.message.edit_text("❌ Этот запрос уже обработан.")
+        return
+
+    db_user = get_user_by_telegram_id(callback.from_user.id)
+    if not db_user or not _can_approve_return(db_user.role):
+        await callback.message.edit_text("❌ У вас нет прав отклонять возврат на склад.")
+        return
+
+    approver = get_return_approver()
+    if not approver or approver.id != db_user.id:
+        await callback.message.edit_text("❌ Отклонять может только назначенный кладовщик или главный администратор.")
+        return
+
+    update_pending_return_status(pending_id, "rejected", db_user.id)
+    from_user = get_user_by_id(pending.from_user_id)
+
+    await callback.message.edit_text(
+        "❌ <b>Возврат на склад отклонён</b>\n\n"
+        f"<b>Актив:</b> {pending.asset_name}\n"
+        f"<b>Количество:</b> {int(pending.qty)}",
+        parse_mode="HTML"
+    )
+    if from_user:
+        try:
+            await callback.bot.send_message(
+                from_user.telegram_id,
+                "↩️ <b>Возврат на склад отклонён</b>\n\n"
+                f"<b>Актив:</b> {pending.asset_name}\n"
+                f"<b>Количество:</b> {int(pending.qty)}\n\n"
+                "Запрос отклонил кладовщик или администратор.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    logger.info(f"Return rejected: pending_id={pending_id}, by={db_user.id}")

@@ -1,4 +1,5 @@
 """Start command handler."""
+import asyncio
 import logging
 from aiogram import Router
 from aiogram.filters import Command
@@ -16,7 +17,6 @@ from src.keyboards.main_menu import main_menu
 logger = logging.getLogger(__name__)
 router = Router()
 
-
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     """Handle /start command."""
@@ -24,12 +24,19 @@ async def cmd_start(message: Message):
     if not user:
         await message.answer("Ошибка: не удалось получить информацию о пользователе")
         return
-    
+
     telegram_id = user.id
     fullname = user.full_name or user.first_name or "Unknown User"
-    
-    # Check if user already exists
-    existing_user = get_user_by_telegram_id(telegram_id)
+
+    # Синхронные вызовы БД — в executor, чтобы бот не зависал
+    try:
+        existing_user = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: get_user_by_telegram_id(telegram_id)
+        )
+    except Exception as e:
+        logger.exception("cmd_start get_user: %s", e)
+        await message.answer("Ошибка доступа к базе данных. Попробуйте позже.")
+        return
     
     if existing_user:
         # User already registered
@@ -63,26 +70,47 @@ async def cmd_start(message: Message):
         return
     
     # User doesn't exist - register them
-    user_count = count_users()
-    
+    try:
+        user_count = await asyncio.get_event_loop().run_in_executor(None, count_users)
+    except Exception as e:
+        logger.exception("cmd_start count_users: %s", e)
+        await message.answer("Ошибка доступа к базе данных. Попробуйте позже.")
+        return
+
     if user_count == 0:
         # First user becomes admin
-        new_user = create_user(
-            telegram_id=telegram_id,
-            fullname=fullname,
-            role=UserRole.SYSTEM_ADMIN.value,
-            status=UserStatus.ACTIVE.value
-        )
+        try:
+            new_user = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: create_user(
+                    telegram_id=telegram_id,
+                    fullname=fullname,
+                    role=UserRole.SYSTEM_ADMIN.value,
+                    status=UserStatus.ACTIVE.value
+                ),
+            )
+        except Exception as e:
+            logger.exception("cmd_start create_user admin: %s", e)
+            await message.answer("Ошибка регистрации. Попробуйте позже.")
+            return
         role_text = "Системный администратор"
         logger.info(f"First user {telegram_id} ({fullname}) created as SYSTEM_ADMIN")
     else:
         # Regular user - create with default role
-        new_user = create_user(
-            telegram_id=telegram_id,
-            fullname=fullname,
-            role=UserRole.UNKNOWN.value,
-            status=UserStatus.ACTIVE.value
-        )
+        try:
+            new_user = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: create_user(
+                    telegram_id=telegram_id,
+                    fullname=fullname,
+                    role=UserRole.UNKNOWN.value,
+                    status=UserStatus.ACTIVE.value
+                ),
+            )
+        except Exception as e:
+            logger.exception("cmd_start create_user: %s", e)
+            await message.answer("Ошибка регистрации. Попробуйте позже.")
+            return
         role_text = "Не зарегистрирован (ожидает одобрения)"
         logger.info(f"New user {telegram_id} ({fullname}) created with role UNKNOWN")
     

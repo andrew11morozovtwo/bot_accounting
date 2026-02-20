@@ -39,12 +39,12 @@ async def auto_sign_operations(bot: Bot):
                         asset = get_asset_by_id(operation.asset_id)
                         asset_name = asset.name if asset else "Неизвестный актив"
                         
-                        # Send notification to recipient
+                        # Send notification to recipient (outgoing or transfer)
                         notification_text = (
-                            "⏰ <b>Автоматическое подписание акта передачи имущества</b>\n\n"
-                            f"Операция передачи имущества <b>{asset_name}</b> "
-                            f"была автоматически подписана через 24 часа после передачи.\n\n"
-                            "Вы несете ответственность за сохранность переданного имущества."
+                            "⏰ <b>Автоматическое подписание</b>\n\n"
+                            f"Операция по имуществу <b>{asset_name}</b> была автоматически подписана "
+                            f"через 24 часа (вы не нажали «Имущество получил» и не обратились к начальнику).\n\n"
+                            "Имущество числится на вас. Вы несете ответственность за его сохранность."
                         )
                         
                         try:
